@@ -67,6 +67,10 @@ class Settings:
     dynamic_size_max_usd_per_leg: Decimal
     enable_pricing_diagnostics: bool = True
     diagnostics_top_n: int = 10
+    crypto_only: bool = True
+    crypto_keywords: tuple[str, ...] = ("btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto", "doge", "xrp")
+    enable_pnl_mode: bool = True
+    clear_console_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -220,6 +224,19 @@ def load_settings() -> Settings:
     if volatility_source not in {"coingecko", "binance"}:
         raise ConfigError("VOLATILITY_SOURCE must be one of: coingecko, binance")
 
+    crypto_keywords_raw = os.getenv("CRYPTO_KEYWORDS", "btc,bitcoin,eth,ethereum,sol,solana,crypto,doge,xrp")
+    crypto_keywords = tuple(k.strip().lower() for k in crypto_keywords_raw.split(",") if k.strip())
+    if not crypto_keywords:
+        raise ConfigError("CRYPTO_KEYWORDS must contain at least one keyword")
+
+    clear_console_seconds_raw = os.getenv("CLEAR_CONSOLE_SECONDS", "60")
+    try:
+        clear_console_seconds = int(clear_console_seconds_raw)
+    except ValueError as exc:
+        raise ConfigError(f"CLEAR_CONSOLE_SECONDS must be an integer, got {clear_console_seconds_raw!r}") from exc
+    if clear_console_seconds < 0:
+        raise ConfigError("CLEAR_CONSOLE_SECONDS must be >= 0")
+
     enable_trading = read_bool_env("ENABLE_TRADING", False)
     dynamic_size_exposure_pct = read_decimal_env("DYNAMIC_SIZE_EXPOSURE_PCT", "10")
     if dynamic_size_exposure_pct > 100:
@@ -273,6 +290,10 @@ def load_settings() -> Settings:
         dynamic_size_max_usd_per_leg=read_decimal_env("DYNAMIC_SIZE_MAX_USD_PER_LEG", "50"),
         enable_pricing_diagnostics=read_bool_env("ENABLE_PRICING_DIAGNOSTICS", True),
         diagnostics_top_n=read_int_env("DIAGNOSTICS_TOP_N", 10),
+        crypto_only=read_bool_env("CRYPTO_ONLY", True),
+        crypto_keywords=crypto_keywords,
+        enable_pnl_mode=read_bool_env("ENABLE_PNL_MODE", True),
+        clear_console_seconds=clear_console_seconds,
     )
 
 
@@ -351,6 +372,31 @@ def fetch_markets(settings: Settings) -> list[dict[str, Any]]:
             break
         offset += settings.page_size
     return markets
+
+
+def _market_text_blob(market: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("question", "description", "slug", "category", "title", "eventTitle", "event_title"):
+        value = market.get(key)
+        if value:
+            parts.append(str(value))
+
+    tags = market.get("tags")
+    if isinstance(tags, list):
+        parts.extend(str(t) for t in tags)
+    elif tags:
+        parts.append(str(tags))
+
+    return " ".join(parts).lower()
+
+
+def filter_crypto_markets(markets: list[dict[str, Any]], keywords: tuple[str, ...]) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for market in markets:
+        blob = _market_text_blob(market)
+        if any(k in blob for k in keywords):
+            filtered.append(market)
+    return filtered
 
 
 def find_mispricings(markets: list[dict[str, Any]], threshold: Decimal) -> list[MispricingEvent]:
@@ -445,6 +491,7 @@ class Trader:
         if settings.enable_trading:
             self.client = self._init_client()
         self._vol_cache: dict[str, tuple[float, Decimal]] = {}
+        self.session_realized_pnl = Decimal("0")
 
     def _infer_underlying(self, question: str) -> str | None:
         q = question.upper()
@@ -755,7 +802,7 @@ class Trader:
         return dynamic.quantize(Decimal("0.0001"))
 
     def enter_if_signal(self, market: dict[str, Any], event: MispricingEvent, market_prices: dict[str, dict[str, Decimal]]) -> None:
-        if not self.settings.enable_trading:
+        if not (self.settings.enable_trading or self.settings.enable_pnl_mode):
             return
         if event.total >= (Decimal("1") - self.settings.mispricing_threshold):
             return
@@ -784,8 +831,9 @@ class Trader:
             return
 
         try:
-            self._place_order(yes_token, "BUY", yes_buy_price, yes_size)
-            self._place_order(no_token, "BUY", no_buy_price, no_size)
+            if self.settings.enable_trading:
+                self._place_order(yes_token, "BUY", yes_buy_price, yes_size)
+                self._place_order(no_token, "BUY", no_buy_price, no_size)
 
             self.store.upsert(
                 Position(
@@ -836,29 +884,43 @@ class Trader:
         if not yes_pos and not no_pos:
             return False
 
+        realized_this_exit = Decimal("0")
+
         try:
             if yes_pos:
                 yes_mark = prices.get("YES")
                 if yes_mark is not None:
                     sell_price = max(Decimal("0.01"), yes_mark - self.settings.price_buffer)
-                    self._place_order(yes_pos.token_id, "SELL", sell_price, yes_pos.quantity)
+                    if self.settings.enable_trading:
+                        self._place_order(yes_pos.token_id, "SELL", sell_price, yes_pos.quantity)
+                    realized_this_exit += (sell_price - yes_pos.average_price) * yes_pos.quantity
                 self.store.remove(market_id, "YES")
 
             if no_pos:
                 no_mark = prices.get("NO")
                 if no_mark is not None:
                     sell_price = max(Decimal("0.01"), no_mark - self.settings.price_buffer)
-                    self._place_order(no_pos.token_id, "SELL", sell_price, no_pos.quantity)
+                    if self.settings.enable_trading:
+                        self._place_order(no_pos.token_id, "SELL", sell_price, no_pos.quantity)
+                    realized_this_exit += (sell_price - no_pos.average_price) * no_pos.quantity
                 self.store.remove(market_id, "NO")
 
-            logging.info("Exited positions for market %s (reason=%s)", market_id, reason)
+            self.session_realized_pnl += realized_this_exit
+            mode = "live" if self.settings.enable_trading else "paper"
+            logging.info(
+                "Exited positions for market %s (reason=%s, mode=%s, realized_delta=%s)",
+                market_id,
+                reason,
+                mode,
+                realized_this_exit,
+            )
             return True
         except Exception:
             logging.exception("Failed executing exits for market %s (reason=%s)", market_id, reason)
             return False
 
     def enforce_risk_exits(self, market_prices: dict[str, dict[str, Decimal]]) -> None:
-        if not self.settings.enable_trading:
+        if not (self.settings.enable_trading or self.settings.enable_pnl_mode):
             return
 
         active_market_ids = {pos.market_id for pos in self.store.positions.values()}
@@ -873,7 +935,7 @@ class Trader:
                 self._close_market_positions(market_id, prices, "stop_loss")
 
     def exit_if_signal(self, market: dict[str, Any], event: MispricingEvent) -> None:
-        if not self.settings.enable_trading:
+        if not (self.settings.enable_trading or self.settings.enable_pnl_mode):
             return
 
         if abs(Decimal("1") - event.total) > self.settings.exit_threshold:
@@ -882,6 +944,21 @@ class Trader:
         prices = {"YES": event.yes_price, "NO": event.no_price}
         self._close_market_positions(event.market_id, prices, "normalization")
 
+
+    def log_pnl_summary(self, market_prices: dict[str, dict[str, Decimal]]) -> None:
+        if not self.settings.enable_pnl_mode:
+            return
+        unrealized = self.store.unrealized_pnl(market_prices)
+        total = self.session_realized_pnl + unrealized
+        mode = "live" if self.settings.enable_trading else "paper"
+        logging.info(
+            "PnL summary | mode=%s | realized=%s | unrealized=%s | total_since_start=%s | open_legs=%d",
+            mode,
+            self.session_realized_pnl,
+            unrealized,
+            total,
+            self.store.count_active(),
+        )
 
 
 def run_bot(settings: Settings) -> None:
@@ -901,10 +978,22 @@ def run_bot(settings: Settings) -> None:
     logging.info("Starting Polymarket mispricing bot")
     logging.info("Polling %s every %ss", settings.gamma_api_url, settings.poll_interval_seconds)
 
+    last_console_clear_at = 0.0
+
     while not should_stop:
         started = time.time()
         try:
+            if settings.clear_console_seconds > 0 and sys.stdout.isatty():
+                now = time.time()
+                if now - last_console_clear_at >= settings.clear_console_seconds:
+                    os.system("cls" if os.name == "nt" else "clear")
+                    last_console_clear_at = now
+
             markets = fetch_markets(settings)
+            total_scanned_before_filter = len(markets)
+            if settings.crypto_only:
+                markets = filter_crypto_markets(markets, settings.crypto_keywords)
+
             market_by_id = {str(m.get("id", "")): m for m in markets if m.get("id") is not None}
             current_ids = set(market_by_id.keys())
             new_market_count = len(current_ids - seen_market_ids)
@@ -918,7 +1007,8 @@ def run_bot(settings: Settings) -> None:
                     market_prices[market_id] = {"YES": yes_p, "NO": no_p}
 
             logging.info(
-                "Scanned %d active markets (%d newly observed this run)",
+                "Scanned %d active markets (%d after crypto filter, %d newly observed this run)",
+                total_scanned_before_filter,
                 len(markets),
                 new_market_count,
             )
@@ -930,6 +1020,7 @@ def run_bot(settings: Settings) -> None:
                     log_pricing_diagnostics(markets, settings.mispricing_threshold, settings.diagnostics_top_n)
 
             trader.enforce_risk_exits(market_prices)
+            trader.log_pnl_summary(market_prices)
 
             for event in events:
                 logging.warning(

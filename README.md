@@ -4,9 +4,10 @@ A Python 3.11 bot that scans active Polymarket markets, detects mispricings (`YE
 
 ## Features
 
-- Continuous scanning of active Polymarket markets (paged API polling).
+- Continuous scanning of active Polymarket markets (paged API polling), with crypto-only filtering enabled by default.
 - Mispricing detection with configurable thresholds.
 - Diagnostics mode that logs the closest near-mispricing markets when no triggers are found.
+- PnL mode that reports realized/unrealized and total since bot start (supports paper/live tracking).
 - Optional Discord alerts.
 - Optional trade execution via Polymarket CLOB API.
 - Position tracking persisted to `positions.json`.
@@ -37,7 +38,7 @@ A Python 3.11 bot that scans active Polymarket markets, detects mispricings (`YE
 ## Strategy behavior
 
 ### Detection
-- Bot fetches active markets each cycle and computes mispricing by:
+- Bot fetches active markets each cycle. By default it then applies a crypto-only filter (`CRYPTO_ONLY=true`) using `CRYPTO_KEYWORDS`, and computes mispricing by:
   - `total = YES_price + NO_price`
   - `deviation = abs(1 - total)`
 - It flags markets where `deviation >= MISPRICING_THRESHOLD`.
@@ -64,6 +65,13 @@ A SELL sequence is triggered when:
   - Per-market stop loss: unrealized PnL for that market `<= -STOP_LOSS_USD`.
 
 If true, bot submits **SELL** orders for tracked quantities using buffered sell prices (`market_price - PRICE_BUFFER`, floored at `0.01`), then removes those legs from local position tracking.
+
+### PnL mode
+- `ENABLE_PNL_MODE=true` logs strategy PnL every cycle:
+  - realized PnL (closed legs),
+  - unrealized PnL (open legs mark-to-market),
+  - total since bot start.
+- If `ENABLE_TRADING=false`, this behaves as **paper PnL** based on entry/exit signals.
 
 ### Dynamic sizing (optional)
 When `ENABLE_DYNAMIC_SIZING=true`, the bot adjusts USD size-per-leg before placing orders:
@@ -109,6 +117,10 @@ Copy `.env.example` to `.env` and set values.
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `ENABLE_PRICING_DIAGNOSTICS` | No | `true` | Log near-threshold markets when no mispricings are found |
 | `DIAGNOSTICS_TOP_N` | No | `10` | Number of near-threshold markets to print each cycle |
+| `ENABLE_PNL_MODE` | No | `true` | Log realized/unrealized/total PnL since startup (paper mode when trading is off) |
+| `CLEAR_CONSOLE_SECONDS` | No | `60` | Auto-clear console interval in seconds (`0` disables) |
+| `CRYPTO_ONLY` | No | `true` | When true, only markets matching `CRYPTO_KEYWORDS` are scanned/traded |
+| `CRYPTO_KEYWORDS` | No | `btc,bitcoin,eth,ethereum,sol,solana,crypto,doge,xrp` | Comma-separated keyword filter for crypto market matching |
 | `DISCORD_WEBHOOK_URL` | No | empty | Optional webhook alerts |
 | `ENABLE_TRADING` | No | `false` | Enable/disable order execution |
 | `POSITIONS_FILE` | No | `positions.json` | Local persisted position state |
@@ -195,9 +207,10 @@ python main.py
 6) Stop the bot anytime with `Ctrl + C`.
 
 ### What you should see
-- Lines like: scanned markets, mispricing checks, and loop timing.
+- Lines like: scanned markets, mispricing checks, and loop timing (including counts after crypto-only filter).
 - If you set a Discord webhook, alert messages when mispricings are found.
 - If no mispricings are found, diagnostics logs will show the closest markets and `gap_to_trigger`.
+- PnL summary lines each cycle (`realized`, `unrealized`, `total_since_start`).
 
 ### Tuning tip for threshold
 - If diagnostics repeatedly show small `gap_to_trigger` values (for example `0.002`), lower `MISPRICING_THRESHOLD` a bit and observe again.
