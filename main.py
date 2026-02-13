@@ -271,8 +271,6 @@ def load_settings() -> Settings:
         dynamic_size_exposure_pct=dynamic_size_exposure_pct,
         dynamic_size_min_usd_per_leg=read_decimal_env("DYNAMIC_SIZE_MIN_USD_PER_LEG", "5"),
         dynamic_size_max_usd_per_leg=read_decimal_env("DYNAMIC_SIZE_MAX_USD_PER_LEG", "50"),
-        enable_pricing_diagnostics=read_bool_env("ENABLE_PRICING_DIAGNOSTICS", True),
-        diagnostics_top_n=read_int_env("DIAGNOSTICS_TOP_N", 10),
     )
 
 
@@ -375,53 +373,6 @@ def find_mispricings(markets: list[dict[str, Any]], threshold: Decimal) -> list[
         )
     return events
 
-
-
-def find_nearest_mispricings(markets: list[dict[str, Any]], threshold: Decimal, top_n: int) -> list[MispricingEvent]:
-    candidates: list[MispricingEvent] = []
-    for market in markets:
-        yes_price, no_price = extract_yes_no_prices(market)
-        if yes_price is None or no_price is None:
-            continue
-        total = yes_price + no_price
-        deviation = abs(Decimal("1") - total)
-        if deviation >= threshold:
-            continue
-        candidates.append(
-            MispricingEvent(
-                market_id=str(market.get("id", "unknown")),
-                question=str(market.get("question", "(no question)")),
-                yes_price=yes_price,
-                no_price=no_price,
-                total=total,
-                deviation=deviation,
-            )
-        )
-
-    candidates.sort(key=lambda e: (threshold - e.deviation, -e.deviation))
-    return candidates[: max(1, top_n)]
-
-
-def log_pricing_diagnostics(markets: list[dict[str, Any]], threshold: Decimal, top_n: int) -> None:
-    nearest = find_nearest_mispricings(markets, threshold, top_n)
-    if not nearest:
-        logging.info("Diagnostics: no near-threshold markets found (top_n=%d)", top_n)
-        return
-
-    logging.info("Diagnostics: nearest %d markets below MISPRICING_THRESHOLD=%s", len(nearest), threshold)
-    for idx, item in enumerate(nearest, start=1):
-        gap = threshold - item.deviation
-        logging.info(
-            "Diag #%d | gap_to_trigger=%s | deviation=%s | total=%s | YES=%s NO=%s | ID=%s | %s",
-            idx,
-            gap,
-            item.deviation,
-            item.total,
-            item.yes_price,
-            item.no_price,
-            item.market_id,
-            item.question,
-        )
 
 def notify_discord(webhook_url: str, event: MispricingEvent, timeout_seconds: int) -> None:
     message = {
@@ -926,8 +877,6 @@ def run_bot(settings: Settings) -> None:
             events = find_mispricings(markets, settings.mispricing_threshold)
             if not events:
                 logging.info("No mispricings above threshold found in this cycle")
-                if settings.enable_pricing_diagnostics:
-                    log_pricing_diagnostics(markets, settings.mispricing_threshold, settings.diagnostics_top_n)
 
             trader.enforce_risk_exits(market_prices)
 
