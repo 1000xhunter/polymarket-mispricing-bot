@@ -6,6 +6,7 @@ A Python 3.11 bot that scans active Polymarket markets, detects mispricings (`YE
 
 - Continuous scanning of active Polymarket markets (paged API polling).
 - Mispricing detection with configurable thresholds.
+- Diagnostics mode that logs the closest near-mispricing markets when no triggers are found.
 - Optional Discord alerts.
 - Optional trade execution via Polymarket CLOB API.
 - Position tracking persisted to `positions.json`.
@@ -29,7 +30,8 @@ A Python 3.11 bot that scans active Polymarket markets, detects mispricings (`YE
 ├── README.md
 ├── docker-compose.yml
 ├── main.py
-└── requirements.txt
+├── requirements.txt
+└── run_local.ps1
 ```
 
 ## Strategy behavior
@@ -39,6 +41,7 @@ A Python 3.11 bot that scans active Polymarket markets, detects mispricings (`YE
   - `total = YES_price + NO_price`
   - `deviation = abs(1 - total)`
 - It flags markets where `deviation >= MISPRICING_THRESHOLD`.
+- If no market crosses threshold and diagnostics are enabled, it logs the nearest candidates (closest `deviation` values below threshold) so you can tune `MISPRICING_THRESHOLD`.
 
 ### Entry execution (BUY trigger)
 A BUY sequence is triggered only when **all** conditions are true:
@@ -104,6 +107,8 @@ Copy `.env.example` to `.env` and set values.
 | `MAX_MARKETS_PER_SCAN` | No | `1000` | Max active markets scanned per cycle |
 | `PAGE_SIZE` | No | `200` | Page size for Gamma API |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
+| `ENABLE_PRICING_DIAGNOSTICS` | No | `true` | Log near-threshold markets when no mispricings are found |
+| `DIAGNOSTICS_TOP_N` | No | `10` | Number of near-threshold markets to print each cycle |
 | `DISCORD_WEBHOOK_URL` | No | empty | Optional webhook alerts |
 | `ENABLE_TRADING` | No | `false` | Enable/disable order execution |
 | `POSITIONS_FILE` | No | `positions.json` | Local persisted position state |
@@ -136,6 +141,28 @@ Copy `.env.example` to `.env` and set values.
 | `VOLATILITY_ROLLING_WINDOW_POINTS` | No | `120` | Number of latest intraday price points used for rolling vol |
 
 ---
+
+## Quick start (one command on Windows)
+
+If you want to avoid typing many setup commands, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_local.ps1
+```
+
+- First run: creates `.venv`, installs deps, creates `.env` (if missing), then starts bot.
+- This avoids manual `Activate.ps1`, so execution-policy issues are much less likely.
+- Later runs (faster):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_local.ps1 -SkipInstall
+```
+
+- Setup only (do not start bot):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_local.ps1 -SetupOnly
+```
 
 ## Super simple local setup (Windows, no GitHub needed)
 
@@ -170,6 +197,50 @@ python main.py
 ### What you should see
 - Lines like: scanned markets, mispricing checks, and loop timing.
 - If you set a Discord webhook, alert messages when mispricings are found.
+- If no mispricings are found, diagnostics logs will show the closest markets and `gap_to_trigger`.
+
+### Tuning tip for threshold
+- If diagnostics repeatedly show small `gap_to_trigger` values (for example `0.002`), lower `MISPRICING_THRESHOLD` a bit and observe again.
+- Keep changes small and test with `ENABLE_TRADING=false` first.
+
+### If you see: "No suitable Python runtime found"
+This means Python 3.11 is not installed (or not detected by the Windows launcher yet).
+
+Use **one** of these options:
+
+**Option A (easiest): install Python 3.11 from python.org**
+1. Download Python 3.11.x (Windows installer).
+2. During install, check: **Add python.exe to PATH**.
+3. Close PowerShell and open it again.
+4. Verify:
+
+```powershell
+py -0
+py -3.11 --version
+```
+
+**Option B: let launcher install via winget**
+
+```powershell
+$env:PYLAUNCHER_ALLOW_INSTALL=1
+py -3.11 --version
+```
+
+**Option C: install with winget directly**
+
+```powershell
+winget install -e --id Python.Python.3.11
+py -3.11 --version
+```
+
+After Python works, continue with:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
 
 ### If something fails
 - If `py -3.11` fails, install Python 3.11 from python.org and check “Add Python to PATH” during install.
