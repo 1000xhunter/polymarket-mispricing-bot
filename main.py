@@ -65,6 +65,8 @@ class Settings:
     dynamic_size_exposure_pct: Decimal
     dynamic_size_min_usd_per_leg: Decimal
     dynamic_size_max_usd_per_leg: Decimal
+    enable_pricing_diagnostics: bool
+    diagnostics_top_n: int
 
 
 @dataclass(frozen=True)
