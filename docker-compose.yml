@@ -1,0 +1,8 @@
+services:
+  mispricing-bot:
+    build: .
+    container_name: polymarket-mispricing-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "main.py"]
