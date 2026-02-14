@@ -36,6 +36,9 @@ For events like `BTC above 69500`, `BTC above 69750`, `BTC above 70000`, the bot
 8. Optionally executes spread trades (paper or live):
    - enters when signal appears,
    - exits when correction criteria are met (`band_prob` drop or pinch below threshold).
+9. When no alert triggers, diagnostics mode prints the closest near-miss pairs so you can tune thresholds.
+10. Prints a per-cycle P&L tracker (realized/unrealized/total) for open spread positions.
+11. Makes trade actions visually obvious in logs (`🚨 TRADE ENTERED`, `✅ TRADE EXITED`) and can auto-clear console on interval.
 
 ## Environment variables
 
@@ -46,6 +49,10 @@ Copy `.env.example` to `.env` and edit.
 | `GAMMA_API_URL` | `https://gamma-api.polymarket.com/markets` | Gamma discovery endpoint |
 | `CLOB_HOST` | `https://clob.polymarket.com` | CLOB REST host |
 | `CLOB_WS_URL` | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | CLOB market websocket |
+| `WS_RECV_TIMEOUT_SECONDS` | `20` | WebSocket read timeout before heartbeat/ping logic |
+| `WS_HEARTBEAT_SECONDS` | `15` | Interval for keepalive ping when idle |
+| `WS_RECONNECT_SECONDS` | `3` | Delay before websocket reconnect attempts |
+| `CLEAR_CONSOLE_SECONDS` | `60` | Auto-clear console interval in seconds (`0` disables) |
 | `REQUEST_TIMEOUT_SECONDS` | `15` | HTTP/WebSocket timeout |
 | `POLL_INTERVAL_SECONDS` | `60` | Market rediscovery interval |
 | `EVAL_INTERVAL_SECONDS` | `2` | Signal evaluation interval |
@@ -96,6 +103,21 @@ Setup only:
 powershell -NoExit -ExecutionPolicy Bypass -File .\run_local.ps1 -SetupOnly
 ```
 
+
+If you see `param : The term 'param' is not recognized`:
+- update to latest `run_local.ps1` (it must start with `param(...)` on line 1),
+- then run from an open PowerShell in the project folder:
+
+```powershell
+.\run_local.ps1
+```
+
+or:
+
+```powershell
+powershell -NoExit -ExecutionPolicy Bypass -File .\run_local.ps1
+```
+
 ## Manual Windows run
 
 ```powershell
@@ -129,3 +151,15 @@ Start with:
 - `ENABLE_PAPER_EXECUTION=true`
 
 Validate signal quality, exits, and logs before enabling live execution.
+
+
+## WebSocket timeout note
+
+`WebSocketTimeoutException: Connection timed out` can happen on idle feeds. The bot now treats this as expected, sends heartbeat pings, and reconnects automatically when needed. Tune `WS_RECV_TIMEOUT_SECONDS`, `WS_HEARTBEAT_SECONDS`, and `WS_RECONNECT_SECONDS` in `.env` for your network conditions.
+
+
+## Console/UI quality-of-life
+
+- The bot now prints a P&L tracker line every evaluation cycle.
+- Trade actions are highlighted with clear markers (`🚨 TRADE ENTERED`, `✅ TRADE EXITED`).
+- Set `CLEAR_CONSOLE_SECONDS=60` (or any value) to routinely clear console output; set `0` to disable.

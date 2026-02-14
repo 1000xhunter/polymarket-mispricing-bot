@@ -1,9 +1,9 @@
-$ErrorActionPreference = "Stop"
-
 param(
     [switch]$SkipInstall,
     [switch]$SetupOnly
 )
+
+$ErrorActionPreference = "Stop"
 
 $venvPython = ".\.venv\Scripts\python.exe"
 

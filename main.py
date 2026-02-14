@@ -15,6 +15,7 @@ from typing import Any
 
 import requests
 import websocket
+from websocket import WebSocketTimeoutException
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
@@ -42,6 +43,8 @@ class Settings:
     crypto_keywords: tuple[str, ...]
     use_midpoint_snapshot: bool
     alert_cooldown_seconds: int
+    enable_diagnostics: bool
+    diagnostics_top_n: int
 
     # Pinch / CDF thresholds
     pinch_score_threshold: Decimal
@@ -75,6 +78,10 @@ class Settings:
     price_buffer: Decimal
     max_open_spreads: int
     positions_file: str
+    ws_recv_timeout_seconds: int
+    ws_heartbeat_seconds: int
+    ws_reconnect_seconds: int
+    clear_console_seconds: int
 
 
 def read_bool_env(name: str, default: bool) -> bool:
@@ -140,6 +147,14 @@ def load_settings() -> Settings:
     if volatility_source not in {"binance", "coingecko"}:
         raise ConfigError("VOLATILITY_SOURCE must be binance or coingecko")
 
+    clear_console_raw = os.getenv("CLEAR_CONSOLE_SECONDS", "60")
+    try:
+        clear_console_seconds = int(clear_console_raw)
+    except ValueError as exc:
+        raise ConfigError(f"CLEAR_CONSOLE_SECONDS must be int, got {clear_console_raw!r}") from exc
+    if clear_console_seconds < 0:
+        raise ConfigError("CLEAR_CONSOLE_SECONDS must be >= 0")
+
     enable_trading = read_bool_env("ENABLE_TRADING", False)
     private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
     if enable_trading and not private_key:
@@ -159,6 +174,8 @@ def load_settings() -> Settings:
         crypto_keywords=crypto_keywords,
         use_midpoint_snapshot=read_bool_env("USE_MIDPOINT_SNAPSHOT", True),
         alert_cooldown_seconds=read_int_env("ALERT_COOLDOWN_SECONDS", 30),
+        enable_diagnostics=read_bool_env("ENABLE_DIAGNOSTICS", True),
+        diagnostics_top_n=read_int_env("DIAGNOSTICS_TOP_N", 20),
         pinch_score_threshold=read_decimal_env("PINCH_SCORE_THRESHOLD", "0.8"),
         narrow_band_prob_threshold=read_decimal_env("NARROW_BAND_PROB_THRESHOLD", "0.35"),
         narrow_band_width_pct_threshold=read_decimal_env("NARROW_BAND_WIDTH_PCT_THRESHOLD", "0.005"),
@@ -184,6 +201,10 @@ def load_settings() -> Settings:
         price_buffer=read_decimal_env("PRICE_BUFFER", "0.01"),
         max_open_spreads=read_int_env("MAX_OPEN_SPREADS", 30),
         positions_file=os.getenv("POSITIONS_FILE", "spread_positions.json"),
+        ws_recv_timeout_seconds=read_int_env("WS_RECV_TIMEOUT_SECONDS", 20),
+        ws_heartbeat_seconds=read_int_env("WS_HEARTBEAT_SECONDS", 15),
+        ws_reconnect_seconds=read_int_env("WS_RECONNECT_SECONDS", 3),
+        clear_console_seconds=clear_console_seconds,
     )
 
 
@@ -238,6 +259,8 @@ class SpreadPosition:
     high_side: str
     low_qty: Decimal
     high_qty: Decimal
+    low_entry_price: Decimal
+    high_entry_price: Decimal
     entry_band_prob: Decimal
     entry_pinch: Decimal
     opened_at: float
@@ -264,6 +287,8 @@ class SpreadStore:
                     high_side=p["high_side"],
                     low_qty=Decimal(str(p["low_qty"])),
                     high_qty=Decimal(str(p["high_qty"])),
+                    low_entry_price=Decimal(str(p["low_entry_price"])),
+                    high_entry_price=Decimal(str(p["high_entry_price"])),
                     entry_band_prob=Decimal(str(p["entry_band_prob"])),
                     entry_pinch=Decimal(str(p["entry_pinch"])),
                     opened_at=float(p["opened_at"]),
@@ -276,7 +301,7 @@ class SpreadStore:
         serialized: dict[str, Any] = {}
         for k, p in self.positions.items():
             d = asdict(p)
-            for fld in ("low_qty", "high_qty", "entry_band_prob", "entry_pinch"):
+            for fld in ("low_qty", "high_qty", "low_entry_price", "high_entry_price", "entry_band_prob", "entry_pinch"):
                 d[fld] = str(d[fld])
             serialized[k] = d
         self.path.write_text(json.dumps(serialized, indent=2), encoding="utf-8")
@@ -524,17 +549,32 @@ class CLOBWebSocketClient:
             try:
                 ws = websocket.WebSocket()
                 ws.connect(self.settings.clob_ws_url, timeout=self.settings.request_timeout_seconds)
+                ws.settimeout(self.settings.ws_recv_timeout_seconds)
                 sub = {"type": "subscribe", "channel": "market", "asset_ids": self.asset_ids, "assets_ids": self.asset_ids}
                 ws.send(json.dumps(sub))
                 logging.info("Subscribed to CLOB ws for %d asset_ids", len(self.asset_ids))
+
+                last_heartbeat = time.time()
                 while not self._stop.is_set():
-                    raw = ws.recv()
-                    payload = json.loads(raw)
-                    for aid, bid, ask, mid in parse_book_message(payload):
-                        self.tracker.upsert(aid, bid, ask, mid)
+                    try:
+                        raw = ws.recv()
+                        payload = json.loads(raw)
+                        for aid, bid, ask, mid in parse_book_message(payload):
+                            self.tracker.upsert(aid, bid, ask, mid)
+                    except WebSocketTimeoutException:
+                        now = time.time()
+                        if now - last_heartbeat >= self.settings.ws_heartbeat_seconds:
+                            try:
+                                ws.ping("keepalive")
+                                last_heartbeat = now
+                                logging.debug("WebSocket heartbeat ping sent")
+                                continue
+                            except Exception:
+                                logging.warning("WebSocket ping failed; reconnecting")
+                                break
             except Exception:
-                logging.exception("WebSocket disconnected; reconnecting in 3s")
-                time.sleep(3)
+                logging.exception("WebSocket disconnected; reconnecting in %ss", self.settings.ws_reconnect_seconds)
+                time.sleep(self.settings.ws_reconnect_seconds)
 
 
 class VolatilityEngine:
@@ -726,10 +766,78 @@ def evaluate_signals(settings: Settings, tracker: BookTracker, markets: list[Thr
     return signals
 
 
+def log_near_miss_diagnostics(settings: Settings, tracker: BookTracker, markets: list[ThresholdMarket], vol_engine: VolatilityEngine) -> None:
+    if not settings.enable_diagnostics:
+        return
+
+    candidates: list[tuple[Decimal, str]] = []
+    grouped: dict[str, list[ThresholdMarket]] = {}
+    for m in markets:
+        grouped.setdefault(group_event_key(m), []).append(m)
+
+    for _, rows in grouped.items():
+        if len(rows) < 2:
+            continue
+        rows = sorted(rows, key=lambda r: r.level)
+        spot = vol_engine.fetch_spot_price_usd(rows[0].underlying)
+        if not spot or spot <= 0:
+            continue
+
+        probs: list[tuple[ThresholdMarket, Decimal]] = []
+        for row in rows:
+            p = tracker.get_mid(row.yes_asset_id)
+            if p is None:
+                continue
+            p = max(Decimal("0"), min(Decimal("1"), p))
+            probs.append((row, p))
+
+        for i in range(len(probs) - 1):
+            low, p_low = probs[i]
+            high, p_high = probs[i + 1]
+            band_prob = p_low - p_high
+            band_width_pct = (high.level - low.level) / spot
+            pinch = band_prob / max(band_width_pct, Decimal("0.000001"))
+
+            mono_gap = settings.monotonicity_tolerance - (p_high - p_low)
+            band_gap = settings.narrow_band_prob_threshold - band_prob
+            pinch_gap = settings.pinch_score_threshold - pinch
+            score = min(mono_gap, band_gap, pinch_gap)
+
+            line = (
+                "Diag near-miss | event=%s | %s->%s | p_low=%.4f p_high=%.4f | "
+                "band_prob=%s (gap=%s) | width=%s | pinch=%s (gap=%s) | mono_gap=%s"
+            ) % (
+                low.event_name,
+                low.level,
+                high.level,
+                float(p_low),
+                float(p_high),
+                band_prob,
+                band_gap,
+                band_width_pct,
+                pinch,
+                pinch_gap,
+                mono_gap,
+            )
+            candidates.append((score, line))
+
+    if not candidates:
+        logging.info("Diagnostics: no eligible adjacent threshold pairs this cycle")
+        return
+
+    candidates.sort(key=lambda x: x[0])
+    top = candidates[: settings.diagnostics_top_n]
+    logging.info("Diagnostics: top %d near-miss pairs", len(top))
+    for _, line in top:
+        logging.info(line)
+
+
+
 class ExecutionEngine:
     def __init__(self, settings: Settings, store: SpreadStore) -> None:
         self.settings = settings
         self.store = store
+        self.session_realized_pnl = Decimal("0")
         self.client: ClobClient | None = None
         if settings.enable_trading:
             self.client = self._init_client()
@@ -760,6 +868,24 @@ class ExecutionEngine:
         if price <= 0:
             return Decimal("0")
         return (self.settings.trade_usd_per_leg / price).quantize(Decimal("0.0001"))
+
+    def _signed_pnl(self, side: str, entry: Decimal, mark: Decimal, qty: Decimal) -> Decimal:
+        if side == "BUY":
+            return (mark - entry) * qty
+        return (entry - mark) * qty
+
+    def log_pnl_summary(self, tracker: BookTracker) -> None:
+        unrealized = Decimal("0")
+        for pos in self.store.positions.values():
+            low_mid = tracker.get_mid(pos.low_asset_id)
+            high_mid = tracker.get_mid(pos.high_asset_id)
+            if low_mid is not None:
+                unrealized += self._signed_pnl(pos.low_side, pos.low_entry_price, low_mid, pos.low_qty)
+            if high_mid is not None:
+                unrealized += self._signed_pnl(pos.high_side, pos.high_entry_price, high_mid, pos.high_qty)
+        total = self.session_realized_pnl + unrealized
+        mode = "live" if self.settings.enable_trading else "paper"
+        logging.info("PnL | mode=%s | realized=%s | unrealized=%s | total=%s | open_spreads=%d", mode, self.session_realized_pnl, unrealized, total, len(self.store.positions))
 
     def maybe_enter(self, sig: PinchSignal) -> None:
         key = f"{sig.event_key}|{sig.level_low}|{sig.level_high}"
@@ -798,13 +924,15 @@ class ExecutionEngine:
                         high_side=high_side,
                         low_qty=low_qty,
                         high_qty=high_qty,
+                        low_entry_price=low_price,
+                        high_entry_price=high_price,
                         entry_band_prob=sig.band_prob,
                         entry_pinch=sig.pinch,
                         opened_at=time.time(),
                     )
                 )
                 mode = "live" if self.settings.enable_trading else "paper"
-                logging.warning("Entered spread %s (mode=%s)", key, mode)
+                logging.warning("🚨 TRADE ENTERED | spread=%s | mode=%s | low=%s@%s (%s) | high=%s@%s (%s)", key, mode, low_qty, low_price, low_side, high_qty, high_price, high_side)
         except Exception:
             logging.exception("Failed entering spread %s", key)
 
@@ -838,9 +966,12 @@ class ExecutionEngine:
                 self._order(pos.low_asset_id, low_exit_side, low_exit_price, pos.low_qty)
                 self._order(pos.high_asset_id, high_exit_side, high_exit_price, pos.high_qty)
 
+            realized_delta = self._signed_pnl(pos.low_side, pos.low_entry_price, low_exit_price, pos.low_qty) + self._signed_pnl(pos.high_side, pos.high_entry_price, high_exit_price, pos.high_qty)
+            self.session_realized_pnl += realized_delta
+
             self.store.remove(key)
             mode = "live" if self.settings.enable_trading else "paper"
-            logging.warning("Exited spread %s (mode=%s, band_prob=%s, pinch=%s)", key, mode, sig.band_prob, sig.pinch)
+            logging.warning("✅ TRADE EXITED | spread=%s | mode=%s | realized_delta=%s | band_prob=%s | pinch=%s", key, mode, realized_delta, sig.band_prob, sig.pinch)
         except Exception:
             logging.exception("Failed exiting spread %s", key)
 
@@ -902,8 +1033,15 @@ def run() -> None:
     last_alert_at: dict[str, float] = {}
     last_refresh_at = time.time()
 
+    last_console_clear = 0.0
+
     while not should_stop:
         try:
+            if settings.clear_console_seconds > 0 and sys.stdout.isatty():
+                now_clear = time.time()
+                if now_clear - last_console_clear >= settings.clear_console_seconds:
+                    os.system("cls" if os.name == "nt" else "clear")
+                    last_console_clear = now_clear
             now = time.time()
             if now - last_refresh_at >= settings.poll_interval_seconds:
                 markets = discover_threshold_markets(settings)
@@ -914,6 +1052,9 @@ def run() -> None:
             signals = evaluate_signals(settings, tracker, markets, vol_engine)
             if not signals:
                 logging.info("No pinch / CDF inconsistency alerts in this cycle")
+                log_near_miss_diagnostics(settings, tracker, markets, vol_engine)
+
+            exec_engine.log_pnl_summary(tracker)
 
             for sig in signals:
                 key = f"{sig.event_key}|{sig.level_low}|{sig.level_high}|{sig.reason}"
