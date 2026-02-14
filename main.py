@@ -66,7 +66,7 @@ class Settings:
     dynamic_size_min_usd_per_leg: Decimal
     dynamic_size_max_usd_per_leg: Decimal
     enable_pricing_diagnostics: bool = True
-    diagnostics_top_n: int = 10
+    diagnostics_top_n: int = 100
     crypto_only: bool = True
     crypto_keywords: tuple[str, ...] = ("btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto", "doge", "xrp")
     enable_pnl_mode: bool = True
@@ -289,7 +289,7 @@ def load_settings() -> Settings:
         dynamic_size_min_usd_per_leg=read_decimal_env("DYNAMIC_SIZE_MIN_USD_PER_LEG", "5"),
         dynamic_size_max_usd_per_leg=read_decimal_env("DYNAMIC_SIZE_MAX_USD_PER_LEG", "50"),
         enable_pricing_diagnostics=read_bool_env("ENABLE_PRICING_DIAGNOSTICS", True),
-        diagnostics_top_n=read_int_env("DIAGNOSTICS_TOP_N", 10),
+        diagnostics_top_n=read_int_env("DIAGNOSTICS_TOP_N", 100),
         crypto_only=read_bool_env("CRYPTO_ONLY", True),
         crypto_keywords=crypto_keywords,
         enable_pnl_mode=read_bool_env("ENABLE_PNL_MODE", True),

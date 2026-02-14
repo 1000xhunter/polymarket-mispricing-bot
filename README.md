@@ -116,7 +116,7 @@ Copy `.env.example` to `.env` and set values.
 | `PAGE_SIZE` | No | `200` | Page size for Gamma API |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `ENABLE_PRICING_DIAGNOSTICS` | No | `true` | Log near-threshold markets when no mispricings are found |
-| `DIAGNOSTICS_TOP_N` | No | `10` | Number of near-threshold markets to print each cycle |
+| `DIAGNOSTICS_TOP_N` | No | `100` | Number of near-threshold markets to print each cycle (use larger value to see broader event coverage) |
 | `ENABLE_PNL_MODE` | No | `true` | Log realized/unrealized/total PnL since startup (paper mode when trading is off) |
 | `CLEAR_CONSOLE_SECONDS` | No | `60` | Auto-clear console interval in seconds (`0` disables) |
 | `CRYPTO_ONLY` | No | `true` | When true, only markets matching `CRYPTO_KEYWORDS` are scanned/traded |
@@ -215,6 +215,7 @@ python main.py
 ### Tuning tip for threshold
 - If diagnostics repeatedly show small `gap_to_trigger` values (for example `0.002`), lower `MISPRICING_THRESHOLD` a bit and observe again.
 - Keep changes small and test with `ENABLE_TRADING=false` first.
+- To inspect a wider universe (more events), set `DIAGNOSTICS_TOP_N=100` or higher.
 
 ### If you see: "No suitable Python runtime found"
 This means Python 3.11 is not installed (or not detected by the Windows launcher yet).
