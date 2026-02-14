@@ -34,7 +34,7 @@ if (-not $SkipInstall) {
 if (-not (Test-Path ".env")) {
     Write-Host "[4/5] Creating .env from .env.example"
     Copy-Item .env.example .env
-    Write-Host "Open .env and fill your values before live trading." -ForegroundColor Yellow
+    Write-Host "Open .env and fill your monitoring/alert settings as needed." -ForegroundColor Yellow
 } else {
     Write-Host "[4/5] .env already exists."
 }
