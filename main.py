@@ -380,6 +380,19 @@ def parse_decimal(value: Any) -> Decimal | None:
         return None
 
 
+def parse_number_token(token: str) -> Decimal | None:
+    raw = token.strip().lower().replace(",", "")
+    m = re.fullmatch(r"(?P<num>\d+(?:\.\d+)?)(?P<sfx>[kmb])?", raw)
+    if not m:
+        return None
+    num = parse_decimal(m.group("num"))
+    if num is None:
+        return None
+    sfx = m.group("sfx")
+    mult = {None: Decimal("1"), "k": Decimal("1000"), "m": Decimal("1000000"), "b": Decimal("1000000000")}[sfx]
+    return num * mult
+
+
 def parse_jsonish(value: Any) -> Any:
     if isinstance(value, str):
         try:
@@ -405,22 +418,35 @@ def parse_end_timestamp(market: dict[str, Any]) -> datetime | None:
 
 
 THRESHOLD_PATTERNS = [
-    re.compile(r"\b(?P<asset>BTC|BITCOIN|ETH|ETHEREUM|SOL|SOLANA)\b.*?\b(above|over|at least)\s*\$?(?P<level>\d+(?:[\.,]\d+)?)", re.IGNORECASE),
-    re.compile(r"\b(?P<asset>BTC|BITCOIN|ETH|ETHEREUM|SOL|SOLANA)\b.*?\b(below|under|at most)\s*\$?(?P<level>\d+(?:[\.,]\d+)?)", re.IGNORECASE),
+    re.compile(r"\b(?P<asset>BTC|BITCOIN|ETH|ETHEREUM|SOL|SOLANA)\b.*?\b(?P<cmp>above|over|at least|greater than|more than)\b\s*\$?(?P<level>\d+(?:[\.,]\d+)?(?:\s*[kmb])?)\b", re.IGNORECASE),
+    re.compile(r"\b(?P<asset>BTC|BITCOIN|ETH|ETHEREUM|SOL|SOLANA)\b.*?\b(?P<cmp>below|under|at most|less than)\b\s*\$?(?P<level>\d+(?:[\.,]\d+)?(?:\s*[kmb])?)\b", re.IGNORECASE),
+    re.compile(r"\b(?P<cmp>above|over|at least|greater than|more than)\b\s*\$?(?P<level>\d+(?:[\.,]\d+)?(?:\s*[kmb])?)\b.*?\b(?P<asset>BTC|BITCOIN|ETH|ETHEREUM|SOL|SOLANA)\b", re.IGNORECASE),
+    re.compile(r"\b(?P<cmp>below|under|at most|less than)\b\s*\$?(?P<level>\d+(?:[\.,]\d+)?(?:\s*[kmb])?)\b.*?\b(?P<asset>BTC|BITCOIN|ETH|ETHEREUM|SOL|SOLANA)\b", re.IGNORECASE),
+]
+
+RANGE_HINT_PATTERNS = [
+    re.compile(r"\bbetween\b\s*\$?\d+(?:[\.,]\d+)?(?:\s*[kmb])?\s*\b(and|to|-)\b\s*\$?\d+(?:[\.,]\d+)?(?:\s*[kmb])?", re.IGNORECASE),
+    re.compile(r"\b(\d+(?:[\.,]\d+)?(?:\s*[kmb])?)\s*\b(to|-)\b\s*(\d+(?:[\.,]\d+)?(?:\s*[kmb])?)\b", re.IGNORECASE),
 ]
 
 
+def looks_like_range_market(text: str) -> bool:
+    t = text.strip()
+    return any(p.search(t) for p in RANGE_HINT_PATTERNS)
+
+
 def parse_threshold_from_question(question: str) -> tuple[str, str, Decimal] | None:
+    text = question.strip()
     for pattern in THRESHOLD_PATTERNS:
-        m = pattern.search(question.strip())
+        m = pattern.search(text)
         if not m:
             continue
         asset = m.group("asset").upper()
-        level = parse_decimal(m.group("level").replace(",", ""))
+        level = parse_number_token(m.group("level").replace(" ", ""))
         if level is None:
             continue
-        token = m.group(2).lower()
-        direction = "above" if token in {"above", "over", "at least"} else "below"
+        token = m.group("cmp").lower()
+        direction = "above" if token in {"above", "over", "at least", "greater than", "more than"} else "below"
         return asset, direction, level
     return None
 
@@ -469,18 +495,31 @@ def fetch_markets(settings: Settings) -> list[dict[str, Any]]:
 
 
 def discover_threshold_markets(settings: Settings) -> list[ThresholdMarket]:
-    raw = fetch_markets(settings)
+    raw_all = fetch_markets(settings)
+    raw = raw_all
     if settings.crypto_only:
         raw = [m for m in raw if any(k in _market_text_blob(m) for k in settings.crypto_keywords)]
 
     out: list[ThresholdMarket] = []
+    parse_miss = 0
+    yes_miss = 0
+    range_like = 0
     for m in raw:
         q = str(m.get("question", ""))
-        parsed = parse_threshold_from_question(q)
+        parse_source = " | ".join(
+            str(m.get(k, ""))
+            for k in ("question", "title", "eventTitle", "description")
+            if m.get(k)
+        )
+        if looks_like_range_market(parse_source):
+            range_like += 1
+        parsed = parse_threshold_from_question(parse_source)
         if not parsed:
+            parse_miss += 1
             continue
         yes_id = extract_yes_asset_id(m)
         if not yes_id:
+            yes_miss += 1
             continue
         asset, direction, level = parsed
         event_name = str(m.get("eventTitle") or m.get("title") or q)
@@ -502,7 +541,22 @@ def discover_threshold_markets(settings: Settings) -> list[ThresholdMarket]:
     for row in out:
         buckets[group_event_key(row)] = buckets.get(group_event_key(row), 0) + 1
     multi = sum(1 for v in buckets.values() if v >= 2)
-    logging.info("Discovered %d threshold-style crypto markets across %d event buckets (%d with >=2 strikes)", len(out), len(buckets), multi)
+    logging.info(
+        "Discovered %d threshold-style crypto markets across %d event buckets (%d with >=2 strikes) | parse_miss=%d | yes_id_missing=%d | range_like=%d | raw_scanned=%d | raw_after_filter=%d",
+        len(out),
+        len(buckets),
+        multi,
+        parse_miss,
+        yes_miss,
+        range_like,
+        len(raw_all),
+        len(raw),
+    )
+    if len(out) == 0 and range_like > 0:
+        logging.warning(
+            "Detected %d range-style market texts but 0 threshold ladders. This bot's pinch logic requires threshold ladders (e.g., BTC > 90k / 95k / 100k).",
+            range_like,
+        )
     return out
 
 
@@ -1125,6 +1179,8 @@ def run() -> None:
     signal.signal(signal.SIGTERM, _handle)
 
     markets = discover_threshold_markets(settings)
+    if not markets:
+        logging.warning("No threshold markets discovered. Check CRYPTO_ONLY/CRYPTO_KEYWORDS and parser coverage for current market wording.")
     asset_ids = sorted({m.yes_asset_id for m in markets})
 
     tracker = BookTracker()
@@ -1154,6 +1210,8 @@ def run() -> None:
             now = time.time()
             if now - last_refresh_at >= settings.poll_interval_seconds:
                 markets = discover_threshold_markets(settings)
+                if not markets:
+                    logging.warning("Refresh found zero threshold markets; diagnostics cannot score proximity until at least one event has 2+ strikes.")
                 asset_ids = sorted({m.yes_asset_id for m in markets})
                 seed_midpoint_snapshot(settings, tracker, asset_ids)
                 last_refresh_at = now

@@ -150,9 +150,18 @@ docker compose down
 ### If you keep seeing `Diagnostics: no eligible adjacent threshold pairs this cycle`
 
 This now includes counters in logs to pinpoint the blocker:
+- `groups_total=0` means no threshold markets were parsed at all (usually filter/parser mismatch),
 - `groups_with_adjacent=0` means strikes are not being bucketed together (usually wording mismatch),
 - `missing_prob_data>0` means websocket/midpoints are not available for enough adjacent markets,
 - `missing_spot>0` means spot fetch failed (the bot now falls back to median strike level so diagnostics can still run).
+
+If `groups_total=0`, temporarily try:
+- `CRYPTO_ONLY=false` (to verify discovery works),
+- broader `CRYPTO_KEYWORDS`,
+- and keep an eye on new discovery counters: `parse_miss` and `yes_id_missing`.
+
+Also check `range_like` in discovery logs:
+- if `range_like>0` while threshold markets stay `0`, Polymarket currently has range/binary wording but no threshold ladder for that asset/timeframe, and this pinch strategy cannot trigger until ladders exist.
 
 ## Safety
 
