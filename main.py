@@ -498,7 +498,11 @@ def discover_threshold_markets(settings: Settings) -> list[ThresholdMarket]:
                 end_ts=parse_end_timestamp(m),
             )
         )
-    logging.info("Discovered %d threshold-style crypto markets", len(out))
+    buckets: dict[str, int] = {}
+    for row in out:
+        buckets[group_event_key(row)] = buckets.get(group_event_key(row), 0) + 1
+    multi = sum(1 for v in buckets.values() if v >= 2)
+    logging.info("Discovered %d threshold-style crypto markets across %d event buckets (%d with >=2 strikes)", len(out), len(buckets), multi)
     return out
 
 
@@ -747,8 +751,34 @@ class VolatilityEngine:
         return daily * Decimal(str(math.sqrt(float(t_days))))
 
 
+def canonical_event_label(m: ThresholdMarket) -> str:
+    if m.condition_id:
+        return f"cond:{m.condition_id}"
+
+    text = (m.event_name or m.question or "").lower()
+    text = re.sub(r"\$?\d+(?:[\.,]\d+)?", "<n>", text)
+    text = re.sub(r"\b(above|over|at least|below|under|at most)\b", "<cmp>", text)
+    text = re.sub(r"[^a-z0-9<>|]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or m.underlying.lower()
+
+
 def group_event_key(m: ThresholdMarket) -> str:
-    return f"{m.underlying}|{m.direction}|{m.event_name}"
+    return f"{m.underlying}|{m.direction}|{canonical_event_label(m)}"
+
+
+def _resolve_spot_for_rows(vol_engine: VolatilityEngine, rows: list[ThresholdMarket]) -> Decimal | None:
+    spot = vol_engine.fetch_spot_price_usd(rows[0].underlying)
+    if spot and spot > 0:
+        return spot
+
+    levels = sorted(r.level for r in rows if r.level > 0)
+    if not levels:
+        return None
+    mid_idx = len(levels) // 2
+    approx = levels[mid_idx]
+    logging.debug("Spot unavailable for %s; using median threshold level as fallback spot=%s", rows[0].underlying, approx)
+    return approx
 
 
 def evaluate_signals(settings: Settings, tracker: BookTracker, markets: list[ThresholdMarket], vol_engine: VolatilityEngine) -> list[PinchSignal]:
@@ -761,7 +791,7 @@ def evaluate_signals(settings: Settings, tracker: BookTracker, markets: list[Thr
         if len(rows) < 2:
             continue
         rows = sorted(rows, key=lambda r: r.level)
-        spot = vol_engine.fetch_spot_price_usd(rows[0].underlying)
+        spot = _resolve_spot_for_rows(vol_engine, rows)
         if not spot or spot <= 0:
             continue
 
@@ -831,12 +861,19 @@ def log_near_miss_diagnostics(settings: Settings, tracker: BookTracker, markets:
     for m in markets:
         grouped.setdefault(group_event_key(m), []).append(m)
 
+    groups_total = len(grouped)
+    groups_with_adjacent = 0
+    groups_missing_spot = 0
+    groups_missing_probs = 0
+
     for _, rows in grouped.items():
         if len(rows) < 2:
             continue
+        groups_with_adjacent += 1
         rows = sorted(rows, key=lambda r: r.level)
-        spot = vol_engine.fetch_spot_price_usd(rows[0].underlying)
+        spot = _resolve_spot_for_rows(vol_engine, rows)
         if not spot or spot <= 0:
+            groups_missing_spot += 1
             continue
 
         probs: list[tuple[ThresholdMarket, Decimal]] = []
@@ -846,6 +883,10 @@ def log_near_miss_diagnostics(settings: Settings, tracker: BookTracker, markets:
                 continue
             p = max(Decimal("0"), min(Decimal("1"), p))
             probs.append((row, p))
+
+        if len(probs) < 2:
+            groups_missing_probs += 1
+            continue
 
         for i in range(len(probs) - 1):
             low, p_low = probs[i]
@@ -878,7 +919,13 @@ def log_near_miss_diagnostics(settings: Settings, tracker: BookTracker, markets:
             candidates.append((score, line))
 
     if not candidates:
-        logging.info("Diagnostics: no eligible adjacent threshold pairs this cycle")
+        logging.info(
+            "Diagnostics: no eligible adjacent threshold pairs this cycle | groups_total=%d | groups_with_adjacent=%d | missing_spot=%d | missing_prob_data=%d",
+            groups_total,
+            groups_with_adjacent,
+            groups_missing_spot,
+            groups_missing_probs,
+        )
         return
 
     candidates.sort(key=lambda x: x[0])

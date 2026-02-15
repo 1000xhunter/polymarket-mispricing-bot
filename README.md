@@ -146,6 +146,14 @@ Stop:
 docker compose down
 ```
 
+
+### If you keep seeing `Diagnostics: no eligible adjacent threshold pairs this cycle`
+
+This now includes counters in logs to pinpoint the blocker:
+- `groups_with_adjacent=0` means strikes are not being bucketed together (usually wording mismatch),
+- `missing_prob_data>0` means websocket/midpoints are not available for enough adjacent markets,
+- `missing_spot>0` means spot fetch failed (the bot now falls back to median strike level so diagnostics can still run).
+
 ## Safety
 
 Start with:
