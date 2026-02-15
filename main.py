@@ -82,6 +82,8 @@ class Settings:
     ws_heartbeat_seconds: int
     ws_reconnect_seconds: int
     clear_console_seconds: int
+    dashboard_interval_seconds: int
+    enable_windows_title: bool
 
 
 def read_bool_env(name: str, default: bool) -> bool:
@@ -205,6 +207,60 @@ def load_settings() -> Settings:
         ws_heartbeat_seconds=read_int_env("WS_HEARTBEAT_SECONDS", 15),
         ws_reconnect_seconds=read_int_env("WS_RECONNECT_SECONDS", 3),
         clear_console_seconds=clear_console_seconds,
+        dashboard_interval_seconds=read_int_env("DASHBOARD_INTERVAL_SECONDS", 10),
+        enable_windows_title=read_bool_env("ENABLE_WINDOWS_TITLE", True),
+    )
+
+
+def set_console_title(title: str, settings: Settings) -> None:
+    if not settings.enable_windows_title:
+        return
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleTitleW(title)
+        elif sys.stdout.isatty():
+            print(f"\33]0;{title}\a", end="", flush=True)
+    except Exception:
+        logging.debug("Unable to set console title", exc_info=True)
+
+
+def log_cycle_dashboard(
+    settings: Settings,
+    cycle: int,
+    markets_count: int,
+    asset_count: int,
+    signal_count: int,
+    open_spreads: int,
+    realized: Decimal,
+    unrealized: Decimal,
+    total: Decimal,
+) -> None:
+    mode = "LIVE" if settings.enable_trading else "PAPER"
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    logging.info("=" * 72)
+    logging.info(
+        "Dashboard | cycle=%d | %s | mode=%s | markets=%d | assets=%d | signals=%d | open_spreads=%d",
+        cycle,
+        now_utc,
+        mode,
+        markets_count,
+        asset_count,
+        signal_count,
+        open_spreads,
+    )
+    logging.info(
+        "P&L      | realized=%s | unrealized=%s | total=%s",
+        realized,
+        unrealized,
+        total,
+    )
+    logging.info("Hints    | Ctrl+C to stop | ENABLE_TRADING=%s | diagnostics=%s", settings.enable_trading, settings.enable_diagnostics)
+    logging.info("=" * 72)
+    set_console_title(
+        f"Polymarket Bot | {mode} | signals={signal_count} | open={open_spreads} | pnl={total}",
+        settings,
     )
 
 
@@ -874,7 +930,7 @@ class ExecutionEngine:
             return (mark - entry) * qty
         return (entry - mark) * qty
 
-    def log_pnl_summary(self, tracker: BookTracker) -> None:
+    def pnl_snapshot(self, tracker: BookTracker) -> tuple[Decimal, Decimal, Decimal]:
         unrealized = Decimal("0")
         for pos in self.store.positions.values():
             low_mid = tracker.get_mid(pos.low_asset_id)
@@ -884,8 +940,12 @@ class ExecutionEngine:
             if high_mid is not None:
                 unrealized += self._signed_pnl(pos.high_side, pos.high_entry_price, high_mid, pos.high_qty)
         total = self.session_realized_pnl + unrealized
+        return self.session_realized_pnl, unrealized, total
+
+    def log_pnl_summary(self, tracker: BookTracker) -> None:
+        realized, unrealized, total = self.pnl_snapshot(tracker)
         mode = "live" if self.settings.enable_trading else "paper"
-        logging.info("PnL | mode=%s | realized=%s | unrealized=%s | total=%s | open_spreads=%d", mode, self.session_realized_pnl, unrealized, total, len(self.store.positions))
+        logging.info("PnL | mode=%s | realized=%s | unrealized=%s | total=%s | open_spreads=%d", mode, realized, unrealized, total, len(self.store.positions))
 
     def maybe_enter(self, sig: PinchSignal) -> None:
         key = f"{sig.event_key}|{sig.level_low}|{sig.level_high}"
@@ -1032,11 +1092,13 @@ def run() -> None:
 
     last_alert_at: dict[str, float] = {}
     last_refresh_at = time.time()
-
     last_console_clear = 0.0
+    last_dashboard_at = 0.0
+    cycle = 0
 
     while not should_stop:
         try:
+            cycle += 1
             if settings.clear_console_seconds > 0 and sys.stdout.isatty():
                 now_clear = time.time()
                 if now_clear - last_console_clear >= settings.clear_console_seconds:
@@ -1054,7 +1116,21 @@ def run() -> None:
                 logging.info("No pinch / CDF inconsistency alerts in this cycle")
                 log_near_miss_diagnostics(settings, tracker, markets, vol_engine)
 
+            realized, unrealized, total = exec_engine.pnl_snapshot(tracker)
             exec_engine.log_pnl_summary(tracker)
+            if now - last_dashboard_at >= settings.dashboard_interval_seconds:
+                log_cycle_dashboard(
+                    settings=settings,
+                    cycle=cycle,
+                    markets_count=len(markets),
+                    asset_count=len(asset_ids),
+                    signal_count=len(signals),
+                    open_spreads=len(spread_store.positions),
+                    realized=realized,
+                    unrealized=unrealized,
+                    total=total,
+                )
+                last_dashboard_at = now
 
             for sig in signals:
                 key = f"{sig.event_key}|{sig.level_low}|{sig.level_high}|{sig.reason}"

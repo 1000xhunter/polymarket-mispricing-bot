@@ -53,6 +53,8 @@ Copy `.env.example` to `.env` and edit.
 | `WS_HEARTBEAT_SECONDS` | `15` | Interval for keepalive ping when idle |
 | `WS_RECONNECT_SECONDS` | `3` | Delay before websocket reconnect attempts |
 | `CLEAR_CONSOLE_SECONDS` | `60` | Auto-clear console interval in seconds (`0` disables) |
+| `DASHBOARD_INTERVAL_SECONDS` | `10` | How often to print the compact runtime dashboard |
+| `ENABLE_WINDOWS_TITLE` | `true` | Update PowerShell/CMD window title with mode/signals/P&L |
 | `REQUEST_TIMEOUT_SECONDS` | `15` | HTTP/WebSocket timeout |
 | `POLL_INTERVAL_SECONDS` | `60` | Market rediscovery interval |
 | `EVAL_INTERVAL_SECONDS` | `2` | Signal evaluation interval |
@@ -160,6 +162,8 @@ Validate signal quality, exits, and logs before enabling live execution.
 
 ## Console/UI quality-of-life
 
-- The bot now prints a P&L tracker line every evaluation cycle.
+- The bot prints a P&L tracker line every evaluation cycle.
+- Every `DASHBOARD_INTERVAL_SECONDS`, it prints a compact dashboard block (cycle/time/mode/markets/signals/open spreads/P&L).
+- On Windows, the terminal title is updated with live status (`ENABLE_WINDOWS_TITLE=true`).
 - Trade actions are highlighted with clear markers (`🚨 TRADE ENTERED`, `✅ TRADE EXITED`).
 - Set `CLEAR_CONSOLE_SECONDS=60` (or any value) to routinely clear console output; set `0` to disable.
